@@ -1,242 +1,153 @@
-#define UNICODE
 #include <windows.h>
-#include <commctrl.h>
-#include <commdlg.h>
+#include <tlhelp32.h>
 #include <string>
-#include <vector>
 
-#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
-static const wchar_t CLASS_NAME[]       = L"CustomInjectorWindow";
-static const UINT    IDC_EDIT_DLL       = 101;
-static const UINT    IDC_BUTTON_BROWSE   = 102;
-static const UINT    IDC_EDIT_PID       = 103;
-static const UINT    IDC_BUTTON_INJECT   = 104;
-static const UINT    IDC_STATIC_STATUS  = 105;
+#define ID_PROCESSBOX   101
+#define ID_DLLBOX       102
+#define ID_BUTTON_INJECT 103
+#define ID_STATUS       104
+#define ID_BUTTON_SELECTDLL 105
 
-// Prototypen
-BOOL           InjectDLL(DWORD pid, const char* dllPath);
-LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+std::wstring Wide(const std::string& str) {
+    int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, NULL, 0);
+    std::wstring result(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &result[0], len);
+    return result;
+}
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
-    // 1) Init Common Controls
-    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_WIN95_CLASSES };
-    InitCommonControlsEx(&icex);
+std::string Narrow(const std::wstring& str) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, NULL, 0, NULL, NULL);
+    std::string result(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, &result[0], len, NULL, NULL);
+    return result;
+}
 
-    // 2) Fensterklasse registrieren
-    WNDCLASSEXW wc = { };
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInst;
-    wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+DWORD GetProcId(const std::wstring& procName) {
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(entry);
+    DWORD pid = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    while (Process32NextW(snapshot, &entry)) {
+        if (procName == entry.szExeFile) {
+            pid = entry.th32ProcessID;
+            break;
+        }
+    }
+    CloseHandle(snapshot);
+    return pid;
+}
+
+bool InjectDLL(DWORD pid, const std::string& dllPath) {
+    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProc) return false;
+
+    LPVOID alloc = VirtualAllocEx(hProc, nullptr, dllPath.size(), MEM_COMMIT, PAGE_READWRITE);
+    if (!alloc) return false;
+
+    WriteProcessMemory(hProc, alloc, dllPath.c_str(), dllPath.size(), nullptr);
+
+    HANDLE thread = CreateRemoteThread(hProc, nullptr, 0,
+        (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA"),
+        alloc, 0, nullptr);
+
+    CloseHandle(hProc);
+    return thread != nullptr;
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    static HWND hProcBox, hDLLBox, hInjectBtn, hStatus, hSelectBtn;
+
+    switch (msg) {
+    case WM_CREATE:
+        hProcBox = CreateWindowW(L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            20, 20, 250, 25, hwnd, (HMENU)ID_PROCESSBOX, NULL, NULL);
+
+        hSelectBtn = CreateWindowW(L"BUTTON", L"Datei auswählen",
+            WS_CHILD | WS_VISIBLE,
+            280, 20, 90, 25,
+            hwnd, (HMENU)ID_BUTTON_SELECTDLL, NULL, NULL);
+
+        hDLLBox = CreateWindowW(L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            20, 60, 250, 25, hwnd, (HMENU)ID_DLLBOX, NULL, NULL);
+
+        hInjectBtn = CreateWindowW(L"BUTTON", L"Inject DLL",
+            WS_CHILD | WS_VISIBLE,
+            280, 60, 90, 25, hwnd, (HMENU)ID_BUTTON_INJECT, NULL, NULL);
+
+        hStatus = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 100, 350, 25, hwnd, (HMENU)ID_STATUS, NULL, NULL);
+        break;
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == ID_BUTTON_SELECTDLL) {
+            wchar_t filePath[MAX_PATH] = { 0 };
+            OPENFILENAMEW ofn = { 0 };
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"DLL-Dateien (*.dll)\0*.dll\0Alle Dateien\0*.*\0";
+            ofn.lpstrFile = filePath;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+            if (GetOpenFileNameW(&ofn)) {
+                SetWindowTextW(hDLLBox, filePath);
+                SetWindowTextW(hStatus, L"📂 DLL ausgewählt");
+            }
+            else {
+                SetWindowTextW(hStatus, L"⚠️ Keine Datei gewählt");
+            }
+        }
+
+        if (LOWORD(wp) == ID_BUTTON_INJECT) {
+            wchar_t procName[256], dllPath[256];
+            GetWindowTextW(hProcBox, procName, 256);
+            GetWindowTextW(hDLLBox, dllPath, 256);
+
+            DWORD pid = GetProcId(procName);
+            if (!pid) {
+                SetWindowTextW(hStatus, L"❌ Prozess nicht gefunden.");
+                break;
+            }
+
+            bool ok = InjectDLL(pid, Narrow(dllPath));
+            SetWindowTextW(hStatus, ok ? L"✅ DLL injiziert!" : L"❌ Injection fehlgeschlagen.");
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    }
+
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    WNDCLASS wc = { };
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"DLLInjectorGUI";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = CLASS_NAME;
-    wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
-    RegisterClassExW(&wc);
+    RegisterClass(&wc);
 
-    // 3) Fenster erstellen
-    HWND hwnd = CreateWindowExW(
-        0,
-        CLASS_NAME,
-        L"DLL Injector v1.0",
-        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        400, 200,
-        nullptr, nullptr,
-        hInst,
-        nullptr
-    );
-    if (!hwnd) return 0;
+    HWND hwnd = CreateWindowW(L"DLLInjectorGUI", L"🔧 DLL Injector by Markus",
+        WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME,
+        300, 200, 400, 180, NULL, NULL, hInst, NULL);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // 4) Message-Loop
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
+    MSG msg = { };
+    while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    return (int)msg.wParam;
-}
-
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    static std::wstring dllPathW;
-
-    switch (msg) {
-    case WM_CREATE:
-        // DLL-Pfad Label
-        CreateWindowW(L"STATIC", L"DLL-Pfad:",
-            WS_CHILD | WS_VISIBLE,
-            10, 10, 60, 20, hwnd, nullptr, nullptr, nullptr);
-
-        // DLL-Pfad Edit
-        CreateWindowW(L"EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            80, 10, 220, 20, hwnd,
-            (HMENU)IDC_EDIT_DLL, nullptr, nullptr);
-
-        // Browse-Button
-        CreateWindowW(L"BUTTON", L"Browse…",
-            WS_CHILD | WS_VISIBLE,
-            310, 10, 70, 20, hwnd,
-            (HMENU)IDC_BUTTON_BROWSE, nullptr, nullptr);
-
-        // PID Label
-        CreateWindowW(L"STATIC", L"PID:",
-            WS_CHILD | WS_VISIBLE,
-            10, 45, 60, 20, hwnd, nullptr, nullptr, nullptr);
-
-        // PID Edit
-        CreateWindowW(L"EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
-            80, 45, 80, 20, hwnd,
-            (HMENU)IDC_EDIT_PID, nullptr, nullptr);
-
-        // Inject-Button
-        CreateWindowW(L"BUTTON", L"Inject",
-            WS_CHILD | WS_VISIBLE,
-            310, 45, 70, 20, hwnd,
-            (HMENU)IDC_BUTTON_INJECT, nullptr, nullptr);
-
-        // Status-Static
-        CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE,
-            10, 80, 370, 60, hwnd,
-            (HMENU)IDC_STATIC_STATUS, nullptr, nullptr);
-        break;
-
-    case WM_COMMAND: {
-        int id = LOWORD(wp);
-
-        if (id == IDC_BUTTON_BROWSE) {
-            OPENFILENAMEW ofn = { };
-            wchar_t szFile[MAX_PATH] = { 0 };
-
-            ofn.lStructSize  = sizeof(ofn);
-            ofn.hwndOwner    = hwnd;
-            ofn.lpstrFilter  = L"DLL Files\0*.dll\0All Files\0*.*\0";
-            ofn.lpstrFile    = szFile;
-            ofn.nMaxFile     = MAX_PATH;
-            ofn.nFilterIndex = 1;
-            ofn.Flags        = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-
-            if (GetOpenFileNameW(&ofn)) {
-                dllPathW = szFile;
-                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_DLL),
-                               dllPathW.c_str());
-            }
-        }
-        else if (id == IDC_BUTTON_INJECT) {
-            // DLL-Pfad auslesen
-            wchar_t bufPath[MAX_PATH] = { 0 };
-            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_DLL),
-                           bufPath, MAX_PATH);
-
-            // PID auslesen
-            wchar_t bufPid[16] = { 0 };
-            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PID),
-                           bufPid, 16);
-
-            DWORD pid = _wtoi(bufPid);
-            if (pid == 0 || wcslen(bufPath) == 0) {
-                SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_STATUS),
-                               L"Ungültige Eingabe!");
-                break;
-            }
-
-            // WideChar → ANSI
-            int len = WideCharToMultiByte(
-                CP_ACP, 0,
-                bufPath, -1,
-                nullptr, 0,
-                nullptr, nullptr);
-            std::vector<char> pathA(len);
-            WideCharToMultiByte(
-                CP_ACP, 0,
-                bufPath, -1,
-                pathA.data(), len,
-                nullptr, nullptr);
-
-            // Injection versuchen
-            BOOL ok = InjectDLL(pid, pathA.data());
-            if (ok) {
-                SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_STATUS),
-                               L"Injektion erfolgreich!");
-            } else {
-                wchar_t err[64];
-                wsprintfW(err,
-                          L"Injektion fehlgeschlagen: %u",
-                          GetLastError());
-                SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_STATUS),
-                               err);
-            }
-        }
-        break;
-    }
-
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    }
-
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-// Minimaler DLL-Injector (ANSI-Pfad)
-BOOL InjectDLL(DWORD pid, const char* dllPath) {
-    HANDLE hProcess = OpenProcess(
-        PROCESS_CREATE_THREAD    |
-        PROCESS_VM_OPERATION     |
-        PROCESS_VM_WRITE         |
-        PROCESS_QUERY_INFORMATION|
-        PROCESS_VM_READ,
-        FALSE, pid);
-    if (!hProcess) return FALSE;
-
-    SIZE_T size = strlen(dllPath) + 1;
-    LPVOID pRemote = VirtualAllocEx(
-        hProcess, nullptr,
-        size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE);
-    if (!pRemote) {
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    if (!WriteProcessMemory(
-            hProcess, pRemote,
-            dllPath, size, nullptr)) {
-        VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    HMODULE hKernel = GetModuleHandleA("kernel32.dll");
-    auto pLoadLib = (LPTHREAD_START_ROUTINE)
-        GetProcAddress(hKernel, "LoadLibraryA");
-    if (!pLoadLib) {
-        VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    HANDLE hThread = CreateRemoteThread(
-        hProcess, nullptr, 0,
-        pLoadLib, pRemote, 0, nullptr);
-    if (!hThread) {
-        VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    WaitForSingleObject(hThread, INFINITE);
-    CloseHandle(hThread);
-    VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-    CloseHandle(hProcess);
-    return TRUE;
+    return 0;
 }
